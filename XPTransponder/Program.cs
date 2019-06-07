@@ -8,11 +8,14 @@ using System.Net;
 using System.Threading;
 using System.IO.Ports;
 using System.Threading.Channels;
+using System.Timers;
+using System.Diagnostics;
 
 namespace XPTransponder
 {
     class Program
     {
+        static bool reportState = false;
 
         static string arduinoPort = "COM6";
         static int xpListenPort = 49012;
@@ -24,6 +27,8 @@ namespace XPTransponder
         static IPEndPoint senderEP;
         static SerialPort _arduinoSerialPort;
         static bool _arduinoReadContinue;
+        static readonly object xpDataLock = new object();
+        static Dictionary<string, float> xpData; // represents current xp data state
 
         static Channel<string> eventQueue = Channel.CreateBounded<string>(new BoundedChannelOptions(100)
         {
@@ -51,9 +56,9 @@ namespace XPTransponder
 
             { "btn_on", "sim/transponder/transponder_on" },
             { "btn_off", "sim/transponder/transponder_off" },
-            { "btn_stby", "sim/transponder/transponder_stby" },
+            { "btn_stby", "sim/transponder/transponder_standby" },
             { "btn_alt", "sim/transponder/transponder_alt" },
-            { "btn_id", "sim/transponder/transponder_id" },
+            { "btn_id", "sim/transponder/transponder_ident" },
         };
 
         static void Main(string[] args)
@@ -81,10 +86,8 @@ namespace XPTransponder
 
             // Set up XP message send process
             sender = new UdpClient("192.168.0.4", xpSendPort);
-            while (true)
-            {
-                ConsumeMessagesOffEventQueue();
-            }
+
+            ConsumeMessagesOffEventQueue(); // blocks
 
             Console.WriteLine("DONE");
             _arduinoReadContinue = false;
@@ -93,31 +96,39 @@ namespace XPTransponder
             listener.Close();
         }
 
-        static async void ConsumeMessagesOffEventQueue()
+        static void ConsumeMessagesOffEventQueue()
         {
+            Console.WriteLine("Listening for events from channel");
             try
             {
                 while (true)
                 {
-                    string ev = await eventQueueReader.ReadAsync();
-                    Console.WriteLine("rec event: {0} from channel", ev);
-                    if (inputToXPCommands.ContainsKey(ev))
+                    if (eventQueueReader.TryRead(out string ev))
                     {
-                        string xpCmd = inputToXPCommands[ev];
-                        Console.WriteLine("{0} -> {1} -> sending to XP", ev, xpCmd);
-                        sendCmdToXP(xpCmd);
+                        processEvent(ev);
                     }
-                    else
-                    {
-                        Console.WriteLine("unknown event received: {0}", ev);
-                    }
-
                 }
             }
             catch (ChannelClosedException e)
             {
                 Console.WriteLine("event channel closed");
             }
+        }
+
+        static void processEvent(string ev)
+        {
+            if (inputToXPCommands.ContainsKey(ev))
+            {
+                string xpCmd = inputToXPCommands[ev];
+                Console.WriteLine("{0} -> {1} -> sending to XP", ev, xpCmd);
+                sendCmdToXP(xpCmd);
+
+            }
+            else
+            {
+                Console.WriteLine("unknown event received: {0}", ev);
+            }
+
         }
 
         static void sendCmdToXP(string cmd)
@@ -135,32 +146,78 @@ namespace XPTransponder
 
         static void listenXPThread()
         {
+            xpData = new Dictionary<string, float>();
+
+            // state reporting for debugging purposes
+            if (reportState)
+            {
+                System.Timers.Timer reportTimer = new System.Timers.Timer(2000); // 5 sec interval
+
+                reportTimer.Elapsed += (sender, e) =>
+                {
+                    Console.WriteLine("Current state");
+                    lock (xpDataLock)
+                    {
+                        foreach (string key in xpData.Keys)
+                        {
+                            Console.WriteLine("{0} -> {1}", key, xpData[key]);
+                        }
+
+                    }
+                };
+                reportTimer.Start();
+
+            }
+
             while (true)
             {
+
                 byte[] recBytes = listener.Receive(ref groupEP);
                 //Console.WriteLine("rec: " + recBytes.Length);
-                //parseDataRef(recBytes);
-                // TODO update state based on this
+                XPDataEntry entry = parseDataRef(recBytes);
+                lock (xpDataLock)
+                {
+                    // if new val is different then old val, signal arduino to update state
+                    if (xpData.ContainsKey(entry.name))
+                    {
+                        float curVal = xpData[entry.name];
+                        if (entry.val != curVal)
+                        {
+                            Console.WriteLine("{0} value changed from {1} -> {2}. Notifying arduino", entry.name, curVal, entry.val);
+                            // TODO send update to arduino
+                        }
+                    }
+                    xpData[entry.name] = entry.val;
+                }
             }
         }
 
 
-        static void parseDataRef(byte[] data)
+        static XPDataEntry parseDataRef(byte[] data)
         {
             // first 5 chars are DREF+
             // next 4 are value
             byte[] val = new byte[4] { data[5], data[6], data[7], data[8] };
             byte[] next = new byte[500];
+            List<byte> byteList = new List<byte>();
 
             for (int i = 0; i < 500; i++)
             {
-                next[i] = data[i + 9];
+                byte b = data[i + 9];
+                if (b.Equals(' ') || b.Equals(0))
+                {
+                    break;
+                }
+                else
+                {
+                    byteList.Add(b);
+                }
             }
 
-            string str = Encoding.ASCII.GetString(next);
+            string str = Encoding.ASCII.GetString(byteList.ToArray());
             float realVal = BitConverter.ToSingle(val, 0);
-            Console.WriteLine("{0} : {1}", str, realVal);
 
+            return new XPDataEntry(str, realVal);
         }
 
         private static byte[] getCommandBytes(string commandString)
@@ -211,6 +268,18 @@ namespace XPTransponder
                 }
             }
             return events;
+        }
+    }
+
+    struct XPDataEntry
+    {
+        public string name;
+        public float val;
+
+        public XPDataEntry(string n, float v)
+        {
+            name = n;
+            val = v;
         }
     }
 }
